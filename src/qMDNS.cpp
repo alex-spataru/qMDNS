@@ -223,8 +223,7 @@ void qMDNS::lookup (const QString& name, const bool preferIPv6) {
 }
 
 /**
- * Called when we receive data from a mDNS service on the network.
- * \note We will only take into account mDNS response packets, not queries.
+ * Called when we receive data from a mDNS client on the network.
  */
 void qMDNS::onReadyRead() {
     QByteArray data;

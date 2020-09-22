@@ -1,0 +1,7 @@
+* text=auto
+
+*.service text
+*.pri text
+*.pro text
+*.cpp text
+*.h text

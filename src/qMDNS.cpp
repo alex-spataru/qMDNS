@@ -11,10 +11,17 @@
 #include <QHostInfo>
 #include <QUdpSocket>
 #include <QHostAddress>
+#include <QNetworkDatagram>
 #include <QNetworkInterface>
 
 #ifdef Q_OS_LINUX
+    #include <cstring>
+    #include <asm/types.h>
+    #include <sys/types.h>
     #include <sys/socket.h>
+    #include <linux/netlink.h>
+    #include <linux/rtnetlink.h>
+    #include <unistd.h>
 #endif
 
 /*
@@ -122,23 +129,25 @@ qMDNS::qMDNS() {
     m_ttl = 4500;
 
     /* Initialize sockets */
-    m_IPv4Socket = new QUdpSocket (this);
-    m_IPv6Socket = new QUdpSocket (this);
+    m_IPv4Socket = nullptr;
+    m_IPv6Socket = nullptr;
+    initSockets();
 
-    /* Read and interpret data received from mDNS group */
-    connect (m_IPv4Socket, &QUdpSocket::readyRead, this, &qMDNS::onReadyRead);
-    connect (m_IPv6Socket, &QUdpSocket::readyRead, this, &qMDNS::onReadyRead);
-
-    /* Bind the sockets to the mDNS multicast group */
-    if (BIND (m_IPv4Socket, QHostAddress::AnyIPv4, MDNS_PORT))
-        m_IPv4Socket->joinMulticastGroup (IPV4_ADDRESS);
-    if (BIND (m_IPv6Socket, QHostAddress::AnyIPv6, MDNS_PORT))
-        m_IPv6Socket->joinMulticastGroup (IPV6_ADDRESS);
+#ifdef Q_OS_LINUX
+    m_NetlinkSocket = openNetlinkSocket(this);
+    if (!m_NetlinkSocket)
+        qWarning() << "Could not open RTNETLINK socket";
+    /* bruh */
+    connect (m_NetlinkSocket, &QUdpSocket::readyRead, this, &qMDNS::onRouteEvent);
+#endif
 }
 
 qMDNS::~qMDNS() {
     delete m_IPv4Socket;
     delete m_IPv6Socket;
+#ifdef Q_OS_LINUX
+    delete m_NetlinkSocket;
+#endif
 }
 
 /**
@@ -289,6 +298,39 @@ void qMDNS::onReadyRead() {
             readResponse (data);
     }
 }
+
+#ifdef Q_OS_LINUX
+/**
+ * Called when we receive an event on our RTNETLINK socket.
+ */
+void qMDNS::onRouteEvent() {
+    bool reinitializeSockets = false;
+    QByteArray data;
+
+    while (m_NetlinkSocket->hasPendingDatagrams()) {
+        data.resize(m_NetlinkSocket->pendingDatagramSize());
+        m_NetlinkSocket->readDatagram(data.data(), data.size());
+
+        unsigned int toRead = data.size();
+        for (struct nlmsghdr *header = (struct nlmsghdr*)data.data();
+            NLMSG_OK (header, toRead); header = NLMSG_NEXT (header, toRead)) {
+            if (header->nlmsg_type == NLMSG_ERROR ||
+                header->nlmsg_type == NLMSG_DONE) {
+                break;
+            }
+
+            if (header->nlmsg_type == RTM_NEWLINK) {
+                reinitializeSockets = true;
+            }
+        }
+    }
+
+    if (reinitializeSockets) {
+        qInfo() << "reinitializing sockets";
+        initSockets();
+    }
+}
+#endif
 
 /**
  * Reads the given query \a data and instructs the class to send a response
@@ -451,6 +493,62 @@ void qMDNS::sendResponse (const quint16 query_id) {
         sendPacket (data);
     }
 }
+
+/*
+ * Initializes the IPv4 and IPv6 mDNS UDP sockets.
+ */
+void qMDNS::initSockets() {
+    if (m_IPv4Socket)
+        delete m_IPv4Socket;
+    if (m_IPv6Socket)
+        delete m_IPv6Socket;
+
+    m_IPv4Socket = new QUdpSocket (this);
+    m_IPv6Socket = new QUdpSocket (this);
+
+    /* Read and interpret data received from mDNS group */
+    connect (m_IPv4Socket, &QUdpSocket::readyRead, this, &qMDNS::onReadyRead);
+    connect (m_IPv6Socket, &QUdpSocket::readyRead, this, &qMDNS::onReadyRead);
+
+    /* Bind the sockets to the mDNS multicast group */
+    if (BIND (m_IPv4Socket, QHostAddress::AnyIPv4, MDNS_PORT))
+        m_IPv4Socket->joinMulticastGroup (IPV4_ADDRESS);
+    if (BIND (m_IPv6Socket, QHostAddress::AnyIPv6, MDNS_PORT))
+        m_IPv6Socket->joinMulticastGroup (IPV6_ADDRESS);
+}
+
+#ifdef Q_OS_LINUX
+/*
+ * Opens an RTNETLINK socket for listening to interface events.
+ */
+QUdpSocket* qMDNS::openNetlinkSocket (QObject* parent) {
+    int sock = socket (AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE);
+
+    if (sock == -1) {
+        return nullptr;
+    }
+
+    struct sockaddr_nl sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.nl_family = AF_NETLINK;
+    sa.nl_groups = RTMGRP_LINK;
+    sa.nl_pid = getpid();
+
+    if (bind (sock, (struct sockaddr*)&sa, sizeof(sa)) == -1) {
+        close (sock);
+        return nullptr;
+    }
+
+    QUdpSocket* qsock = new QUdpSocket (this);
+
+    if (!qsock->setSocketDescriptor(sock)) {
+        close (sock);
+        return nullptr;
+    }
+
+    return qsock;
+}
+#endif
 
 /**
  * Extracts the host name from the \a data received from the mDNS network.

@@ -27,3 +27,11 @@
 *.exe
 *.out
 *.app
+
+# Qt-specific
+.qmake.stash
+moc_*.h
+moc_*.cpp
+
+Makefile
+qmdns-responder
